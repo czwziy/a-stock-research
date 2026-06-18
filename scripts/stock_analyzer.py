@@ -35,6 +35,10 @@ def em_get(url: str, params: dict = None, headers: dict = None,
         time.sleep(wait + random.uniform(0.1, 0.5))
     try:
         return EM_SESSION.get(url, params=params, headers=headers, timeout=timeout, **kwargs)
+    except Exception as e:
+        # 记录错误但不中断程序
+        print(f"[网络错误] {e}")
+        raise
     finally:
         _em_last_call[0] = time.time()
 
@@ -186,14 +190,20 @@ def mootdx_finance(code: str):
     """mootdx 财务快照"""
     try:
         from mootdx.quotes import Quotes
-        client = Quotes.factory(market='std')
-        fin = client.finance(symbol=code)
-        # mootdx finance 返回的是 tuple (data_list, field_names)
-        if isinstance(fin, tuple) and len(fin) >= 2:
-            data_list = fin[0]
-            if data_list and len(data_list) > 0:
-                return data_list[0]  # 返回第一条记录
-        return fin
+        # 尝试多个服务器
+        for market_type in ['std', 'ext']:
+            try:
+                client = Quotes.factory(market=market_type)
+                fin = client.finance(symbol=code)
+                # mootdx finance 返回的是 tuple (data_list, field_names)
+                if isinstance(fin, tuple) and len(fin) >= 2:
+                    data_list = fin[0]
+                    if data_list and len(data_list) > 0:
+                        return data_list[0]  # 返回第一条记录
+                return fin
+            except Exception:
+                continue
+        return None
     except Exception as e:
         print(f"[WARN] mootdx 财务数据获取失败: {e}")
         return None
@@ -356,11 +366,19 @@ def ths_eps_forecast(code: str) -> pd.DataFrame:
         r = requests.get(url, headers=headers, timeout=15)
         r.encoding = "gbk"
         dfs = pd.read_html(StringIO(r.text))
+        # 查找包含"每股收益"或"EPS"的表格
         for df in dfs:
             cols = [str(c) for c in df.columns]
-            if any("每股收益" in c or "均值" in c for c in cols):
+            # 检查是否包含 EPS 相关列
+            if any("每股收益" in c or "EPS" in c.upper() or "均值" in c for c in cols):
+                # 进一步验证：检查是否有年度数据（如2024、2025等）
+                if any(str(c).isdigit() and len(str(c)) == 4 for c in cols):
+                    return df
+        # 如果没有找到完全匹配的，返回第一个看起来像 EPS 预测的表格
+        for df in dfs:
+            if len(df.columns) >= 3:
                 return df
-        return dfs[0] if dfs else pd.DataFrame()
+        return pd.DataFrame()
     except Exception as e:
         print(f"[WARN] 同花顺一致预期获取失败: {e}")
         return pd.DataFrame()
@@ -460,11 +478,21 @@ def dividend_history(code: str, page_size: int = 10) -> list:
     )
     rows = []
     for row in data:
+        # 东财返回的是每10股的金额，需要转换为每股
+        bonus_per_10 = row.get("PRETAX_BONUS_RMB", 0) or 0
+        bonus_per_share = round(bonus_per_10 / 10, 2) if bonus_per_10 else 0
+
+        transfer_per_10 = row.get("TRANSFER_RATIO", 0) or 0
+        transfer_per_share = round(transfer_per_10 / 10, 2) if transfer_per_10 else 0
+
+        bonus_ratio_per_10 = row.get("BONUS_RATIO", 0) or 0
+        bonus_ratio_per_share = round(bonus_ratio_per_10 / 10, 2) if bonus_ratio_per_10 else 0
+
         rows.append({
             "date": str(row.get("EX_DIVIDEND_DATE", ""))[:10],
-            "bonus_rmb": row.get("PRETAX_BONUS_RMB", 0),
-            "transfer_ratio": row.get("TRANSFER_RATIO", 0),
-            "bonus_ratio": row.get("BONUS_RATIO", 0),
+            "bonus_rmb": bonus_per_share,  # 每股派息
+            "transfer_ratio": transfer_per_share,  # 每股转增
+            "bonus_ratio": bonus_ratio_per_share,  # 每股送股
             "plan": row.get("ASSIGN_PROGRESS", ""),
         })
     return rows
