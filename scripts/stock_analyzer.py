@@ -12,6 +12,7 @@ import random
 import requests
 import pandas as pd
 import urllib.request
+import urllib.parse
 from datetime import datetime, timedelta
 from pathlib import Path
 from io import StringIO
@@ -97,7 +98,8 @@ def search_stock_code(name: str) -> str:
     """通过股票名称搜索股票代码"""
     try:
         # 使用腾讯接口搜索
-        url = f"https://smartbox.gtimg.cn/s3/?v=2&q={name}&t=all"
+        encoded_name = urllib.parse.quote(name)
+        url = f"https://smartbox.gtimg.cn/s3/?v=2&q={encoded_name}&t=all"
         req = urllib.request.Request(url)
         req.add_header("User-Agent", "Mozilla/5.0")
         resp = urllib.request.urlopen(req, timeout=10)
