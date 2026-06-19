@@ -19,46 +19,10 @@ from io import StringIO
 
 # ==================== 全局配置 ====================
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
-DATACENTER_URL = "https://datacenter-web.eastmoney.com/api/data/v1/get"
 
-# 东财防封：全局节流 + 会话复用
-EM_SESSION = requests.Session()
-EM_SESSION.headers.update({"User-Agent": UA})
-EM_MIN_INTERVAL = 1.0
-_em_last_call = [0.0]
-
-
-def em_get(url: str, params: dict = None, headers: dict = None,
-           timeout: int = 15, **kwargs):
-    """东财统一请求入口：自动节流 + 复用 session + 默认 UA"""
-    wait = EM_MIN_INTERVAL - (time.time() - _em_last_call[0])
-    if wait > 0:
-        time.sleep(wait + random.uniform(0.1, 0.5))
-    try:
-        return EM_SESSION.get(url, params=params, headers=headers, timeout=timeout, **kwargs)
-    except Exception as e:
-        # 记录错误但不中断程序
-        print(f"[网络错误] {e}")
-        raise
-    finally:
-        _em_last_call[0] = time.time()
-
-
-def eastmoney_datacenter(report_name: str, columns: str = "ALL",
-                          filter_str: str = "", page_size: int = 50,
-                          sort_columns: str = "", sort_types: str = "-1") -> list:
-    """东财数据中心统一查询"""
-    params = {
-        "reportName": report_name, "columns": columns,
-        "filter": filter_str, "pageNumber": "1", "pageSize": str(page_size),
-        "sortColumns": sort_columns, "sortTypes": sort_types,
-        "source": "WEB", "client": "WEB",
-    }
-    r = em_get(DATACENTER_URL, params=params, timeout=15)
-    d = r.json()
-    if d.get("result") and d["result"].get("data"):
-        return d["result"]["data"]
-    return []
+# 新浪接口会话
+SINA_SESSION = requests.Session()
+SINA_SESSION.headers.update({"User-Agent": UA})
 
 
 # ==================== 工具函数 ====================
@@ -223,138 +187,329 @@ def mootdx_f10(code: str, category: str = "最新提示"):
         return None
 
 
-def eastmoney_stock_info(code: str) -> dict:
-    """东财个股基本面信息"""
-    market_code = 1 if code.startswith("6") else 0
-    url = "https://push2.eastmoney.com/api/qt/stock/get"
-    params = {
-        "fltt": "2", "invt": "2",
-        "fields": "f57,f58,f84,f85,f127,f116,f117,f189,f43",
-        "secid": f"{market_code}.{code}",
-    }
+def sina_stock_info(code: str) -> dict:
+    """新浪个股基本面信息"""
+    prefix = get_prefix(code)
+    url = f"https://finance.sina.com.cn/realstock/company/{prefix}{code}/nc.shtml"
     headers = {"User-Agent": UA}
-    r = em_get(url, params=params, headers=headers, timeout=10)
-    d = r.json().get("data", {})
-    return {
-        "code": d.get("f57", ""),
-        "name": d.get("f58", ""),
-        "industry": d.get("f127", ""),
-        "total_shares": d.get("f84", 0),
-        "float_shares": d.get("f85", 0),
-        "mcap": d.get("f116", 0),
-        "float_mcap": d.get("f117", 0),
-        "list_date": str(d.get("f189", "")),
-        "price": d.get("f43", 0),
-    }
-
-
-def eastmoney_concept_blocks(code: str) -> dict:
-    """个股所属板块/概念归属"""
-    market_code = 1 if code.startswith("6") else 0
-    params = {
-        "fltt": "2", "invt": "2",
-        "secid": f"{market_code}.{code}",
-        "spt": "3", "pi": "0", "pz": "200", "po": "1",
-        "fields": "f12,f14,f3,f128",
-    }
-    headers = {"User-Agent": UA, "Referer": "https://quote.eastmoney.com/"}
     try:
-        r = em_get("https://push2.eastmoney.com/api/qt/slist/get",
-                   params=params, headers=headers, timeout=15)
-        d = r.json()
+        r = SINA_SESSION.get(url, headers=headers, timeout=15)
+        r.encoding = "gbk"
+        
+        # 从页面提取信息
+        info = {
+            "code": code,
+            "name": "",
+            "industry": "",
+            "total_shares": 0,
+            "float_shares": 0,
+            "mcap": 0,
+            "float_mcap": 0,
+            "list_date": "",
+            "price": 0,
+        }
+        
+        # 提取股票名称
+        if "var hq_str" in r.text:
+            import re
+            match = re.search(r'var hq_str_[a-z]{2}\d+="([^,]+)', r.text)
+            if match:
+                info["name"] = match.group(1)
+        
+        return info
     except Exception as e:
-        print(f"[WARN] 东财板块归属请求失败: {e}")
-        return {"total": 0, "boards": [], "concept_tags": []}
-
-    diff = (d.get("data") or {}).get("diff") or {}
-    items = diff.values() if isinstance(diff, dict) else diff
-    boards = []
-    for it in items:
-        boards.append({
-            "name": it.get("f14", ""),
-            "code": it.get("f12", ""),
-            "change_pct": it.get("f3", ""),
-            "lead_stock": it.get("f128", ""),
-        })
-    return {
-        "total": len(boards),
-        "boards": boards,
-        "concept_tags": [b["name"] for b in boards],
-    }
+        print(f"[WARN] 新浪基本面请求失败: {e}")
+        return {}
 
 
-def eastmoney_fund_flow_minute(code: str) -> list:
-    """个股资金流向（分钟级）"""
-    secid = f"1.{code}" if code.startswith("6") else f"0.{code}"
-    url = "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get"
+def sina_finance_data(code: str) -> dict:
+    """新浪财务数据"""
+    prefix = get_prefix(code)
+    url = f"https://finance.sina.com.cn/realstock/company/{prefix}{code}/nc.shtml"
+    headers = {"User-Agent": UA}
+    try:
+        r = SINA_SESSION.get(url, headers=headers, timeout=15)
+        r.encoding = "gbk"
+        
+        # 从页面提取财务数据
+        data = {
+            "eps": 0,
+            "bvps": 0,
+            "roe": 0,
+            "profit": 0,
+            "income": 0,
+            "total_shares": 0,
+            "float_shares": 0,
+        }
+        
+        # 简单提取（实际应该用正则或解析HTML）
+        import re
+        eps_match = re.search(r'每股收益[^:]*：([0-9.-]+)', r.text)
+        if eps_match:
+            data["eps"] = float(eps_match.group(1))
+        
+        bvps_match = re.search(r'每股净资产[^:]*：([0-9.-]+)', r.text)
+        if bvps_match:
+            data["bvps"] = float(bvps_match.group(1))
+        
+        return data
+    except Exception as e:
+        print(f"[WARN] 新浪财务数据请求失败: {e}")
+        return {}
+
+
+def sina_fund_flow(code: str, days: int = 120) -> list:
+    """新浪资金流向（日级）"""
+    prefix = get_prefix(code)
+    url = f"https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/MoneyFlow.ssl_bkzj_zjlrqs"
     params = {
-        "secid": secid, "klt": 1,
-        "fields1": "f1,f2,f3,f7",
-        "fields2": "f51,f52,f53,f54,f55,f56,f57",
+        "page": "1",
+        "num": str(days),
+        "sort": "opendate",
+        "asc": "0",
+        "bankuai": "",
+        "shession": f"{prefix}{code}",
     }
     headers = {
         "User-Agent": UA,
-        "Referer": "https://quote.eastmoney.com/",
-        "Origin": "https://quote.eastmoney.com",
+        "Referer": "https://vip.stock.finance.sina.com.cn/",
     }
     try:
-        r = em_get(url, params=params, headers=headers, timeout=10)
-        d = r.json()
+        r = SINA_SESSION.get(url, params=params, headers=headers, timeout=15)
+        data = r.json()
+        
+        rows = []
+        for item in data:
+            rows.append({
+                "date": item.get("opendate", ""),
+                "main_net": float(item.get("r0_net", 0) or 0),
+                "small_net": float(item.get("r1_net", 0) or 0),
+                "mid_net": float(item.get("r2_net", 0) or 0),
+                "large_net": float(item.get("r3_net", 0) or 0),
+                "super_net": float(item.get("r4_net", 0) or 0),
+            })
+        return rows
     except Exception as e:
-        print(f"[WARN] push2 资金流请求失败: {e}")
+        print(f"[WARN] 新浪资金流请求失败: {e}")
         return []
 
-    rows = []
-    for line in d.get("data", {}).get("klines", []):
-        parts = line.split(",")
-        if len(parts) >= 6:
-            rows.append({
-                "time": parts[0],
-                "main_net": float(parts[1]),
-                "small_net": float(parts[2]),
-                "mid_net": float(parts[3]),
-                "large_net": float(parts[4]),
-                "super_net": float(parts[5]),
-            })
-    return rows
+
+def sina_margin_trading(code: str, page_size: int = 10) -> list:
+    """新浪融资融券明细"""
+    prefix = get_prefix(code)
+    url = f"https://vip.stock.finance.sina.com.cn/corp/go.php/vRM_MarginDetail/stockid/{code}.phtml"
+    headers = {"User-Agent": UA}
+    try:
+        r = SINA_SESSION.get(url, headers=headers, timeout=15)
+        r.encoding = "gbk"
+        
+        # 解析HTML表格
+        dfs = pd.read_html(StringIO(r.text))
+        if not dfs:
+            return []
+        
+        # 找到融资融券表格
+        for df in dfs:
+            if "日期" in df.columns and "融资余额" in df.columns:
+                rows = []
+                for _, row in df.head(page_size).iterrows():
+                    rows.append({
+                        "date": str(row.get("日期", "")),
+                        "rzye": float(row.get("融资余额", 0) or 0),
+                        "rzmre": float(row.get("融资买入额", 0) or 0),
+                        "rzche": float(row.get("融资偿还额", 0) or 0),
+                        "rqye": float(row.get("融券余额", 0) or 0),
+                        "rqmcl": float(row.get("融券卖出量", 0) or 0),
+                        "rqchl": float(row.get("融券偿还量", 0) or 0),
+                        "rzrqye": float(row.get("融资融券余额", 0) or 0),
+                    })
+                return rows
+        return []
+    except Exception as e:
+        print(f"[WARN] 新浪融资融券请求失败: {e}")
+        return []
 
 
-def stock_fund_flow_120d(code: str) -> list:
-    """个股资金流（日级，120日）"""
-    market_code = 1 if code.startswith("6") else 0
-    url = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
-    params = {
-        "secid": f"{market_code}.{code}",
-        "fields1": "f1,f2,f3,f7",
-        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65",
-        "lmt": "120",
-    }
+def sina_holder_num(code: str, page_size: int = 5) -> list:
+    """新浪股东户数变化"""
+    prefix = get_prefix(code)
+    url = f"https://vip.stock.finance.sina.com.cn/corp/go.php/vSD_NumShareholder/stockid/{code}.phtml"
+    headers = {"User-Agent": UA}
+    try:
+        r = SINA_SESSION.get(url, headers=headers, timeout=15)
+        r.encoding = "gbk"
+        
+        # 解析HTML表格
+        dfs = pd.read_html(StringIO(r.text))
+        if not dfs:
+            return []
+        
+        # 找到股东户数表格
+        for df in dfs:
+            if "截止日期" in df.columns and "股东户数" in df.columns:
+                rows = []
+                for _, row in df.head(page_size).iterrows():
+                    rows.append({
+                        "date": str(row.get("截止日期", "")),
+                        "holder_num": int(row.get("股东户数", 0) or 0),
+                        "change_num": int(row.get("较上期变化", 0) or 0),
+                        "change_ratio": float(row.get("变化率(%)", 0) or 0),
+                        "avg_shares": float(row.get("户均持股数", 0) or 0),
+                    })
+                return rows
+        return []
+    except Exception as e:
+        print(f"[WARN] 新浪股东户数请求失败: {e}")
+        return []
+
+
+def sina_dividend_history(code: str, page_size: int = 10) -> list:
+    """新浪分红送转历史"""
+    prefix = get_prefix(code)
+    url = f"https://vip.stock.finance.sina.com.cn/corp/go.php/vISSUE_ShareBonus/stockid/{code}.phtml"
+    headers = {"User-Agent": UA}
+    try:
+        r = SINA_SESSION.get(url, headers=headers, timeout=15)
+        r.encoding = "gbk"
+        
+        # 解析HTML表格
+        dfs = pd.read_html(StringIO(r.text))
+        if not dfs:
+            return []
+        
+        # 找到分红表格（查找包含"派息"或"送股"的表格）
+        for df in dfs:
+            cols = [str(c) for c in df.columns]
+            # 检查是否包含分红相关列
+            if any("派息" in c or "送股" in c or "转增" in c for c in cols):
+                rows = []
+                for _, row in df.head(page_size).iterrows():
+                    # 新浪返回的是每10股数据，需要转换为每股
+                    bonus_per_10 = 0
+                    transfer_per_10 = 0
+                    bonus_ratio_per_10 = 0
+                    
+                    # 查找派息列
+                    for col in df.columns:
+                        col_str = str(col)
+                        if "派息" in col_str:
+                            bonus_per_10 = float(row[col] or 0)
+                        elif "转增" in col_str:
+                            transfer_per_10 = float(row[col] or 0)
+                        elif "送股" in col_str:
+                            bonus_ratio_per_10 = float(row[col] or 0)
+                    
+                    # 转换为每股
+                    bonus_per_share = round(bonus_per_10 / 10, 2) if bonus_per_10 else 0
+                    transfer_per_share = round(transfer_per_10 / 10, 2) if transfer_per_10 else 0
+                    bonus_ratio_per_share = round(bonus_ratio_per_10 / 10, 2) if bonus_ratio_per_10 else 0
+                    
+                    # 查找公告日期和进度
+                    date_str = ""
+                    plan_str = ""
+                    for col in df.columns:
+                        col_str = str(col)
+                        if "公告日期" in col_str:
+                            date_str = str(row[col])
+                        elif "进度" in col_str:
+                            plan_str = str(row[col])
+                    
+                    rows.append({
+                        "date": date_str,
+                        "bonus_rmb": bonus_per_share,
+                        "transfer_ratio": transfer_per_share,
+                        "bonus_ratio": bonus_ratio_per_share,
+                        "plan": plan_str,
+                    })
+                return rows
+        return []
+    except Exception as e:
+        print(f"[WARN] 新浪分红历史请求失败: {e}")
+        return []
+
+
+def sina_lockup_expiry(code: str, trade_date: str, forward_days: int = 90) -> dict:
+    """新浪限售解禁日历"""
+    prefix = get_prefix(code)
+    url = f"https://vip.stock.finance.sina.com.cn/corp/go.php/vRestricted_Stock/stockid/{code}.phtml"
+    headers = {"User-Agent": UA}
+    try:
+        r = SINA_SESSION.get(url, headers=headers, timeout=15)
+        r.encoding = "gbk"
+        
+        # 解析HTML表格
+        dfs = pd.read_html(StringIO(r.text))
+        
+        history = []
+        upcoming = []
+        
+        for df in dfs:
+            if "解禁日期" in df.columns:
+                for _, row in df.iterrows():
+                    date_str = str(row.get("解禁日期", ""))
+                    if not date_str or date_str == "nan":
+                        continue
+                    
+                    item = {
+                        "date": date_str[:10],
+                        "type": str(row.get("股份类型", "")),
+                        "shares": int(row.get("解禁数量(股)", 0) or 0),
+                        "ratio": float(row.get("占总股本比例(%)", 0) or 0),
+                    }
+                    
+                    # 判断是历史还是未来
+                    try:
+                        item_date = datetime.strptime(item["date"], "%Y-%m-%d")
+                        trade_dt = datetime.strptime(trade_date, "%Y-%m-%d")
+                        end_dt = trade_dt + timedelta(days=forward_days)
+                        
+                        if item_date < trade_dt and item_date > trade_dt - timedelta(days=365):
+                            history.append(item)
+                        elif trade_dt <= item_date <= end_dt:
+                            upcoming.append(item)
+                    except:
+                        pass
+        
+        return {"history": history, "upcoming": upcoming}
+    except Exception as e:
+        print(f"[WARN] 新浪解禁预警请求失败: {e}")
+        return {"history": [], "upcoming": []}
+
+
+def sina_stock_news(code: str, page_size: int = 10) -> list:
+    """新浪个股新闻"""
+    prefix = get_prefix(code)
+    url = f"https://vip.stock.finance.sina.com.cn/corp/view/vCB_AllNews.php?stockid={code}"
     headers = {
         "User-Agent": UA,
-        "Referer": "https://quote.eastmoney.com/",
-        "Origin": "https://quote.eastmoney.com",
+        "Referer": "https://vip.stock.finance.sina.com.cn/",
     }
     try:
-        r = em_get(url, params=params, headers=headers, timeout=15)
-        d = r.json()
+        r = SINA_SESSION.get(url, headers=headers, timeout=15)
+        r.encoding = "gbk"
+        
+        # 简单提取新闻标题
+        import re
+        news_list = []
+        
+        # 查找新闻链接
+        pattern = r'<a[^>]+href="([^"]+)"[^>]*>([^<]+)</a>'
+        matches = re.findall(pattern, r.text)
+        
+        for url, title in matches[:page_size]:
+            if "news" in url or "finance" in url:
+                news_list.append({
+                    "title": title.strip(),
+                    "content": "",
+                    "time": "",
+                    "source": "新浪财经",
+                    "url": url,
+                })
+        
+        return news_list
     except Exception as e:
-        print(f"[WARN] push2 资金流请求失败: {e}")
+        print(f"[WARN] 新浪新闻请求失败: {e}")
         return []
-    klines = d.get("data", {}).get("klines", [])
-
-    rows = []
-    for line in klines:
-        parts = line.split(",")
-        if len(parts) >= 7:
-            rows.append({
-                "date": parts[0],
-                "main_net": float(parts[1]) if parts[1] != "-" else 0,
-                "small_net": float(parts[2]) if parts[2] != "-" else 0,
-                "mid_net": float(parts[3]) if parts[3] != "-" else 0,
-                "large_net": float(parts[4]) if parts[4] != "-" else 0,
-                "super_net": float(parts[5]) if parts[5] != "-" else 0,
-            })
-    return rows
 
 
 def ths_eps_forecast(code: str) -> pd.DataFrame:
@@ -384,200 +539,6 @@ def ths_eps_forecast(code: str) -> pd.DataFrame:
     except Exception as e:
         print(f"[WARN] 同花顺一致预期获取失败: {e}")
         return pd.DataFrame()
-
-
-def eastmoney_reports(code: str, max_pages: int = 2) -> list:
-    """东财研报列表"""
-    import json as _json
-    import re as _re
-
-    all_records = []
-    for page in range(1, max_pages + 1):
-        params = {
-            "industryCode": "*", "pageSize": "50", "industry": "*",
-            "rating": "*", "ratingChange": "*",
-            "beginTime": "2024-01-01", "endTime": "2030-01-01",
-            "pageNo": str(page), "fields": "", "qType": "0",
-            "orgCode": "", "code": code, "rcode": "",
-            "p": str(page), "pageNum": str(page), "pageNumber": str(page),
-        }
-        try:
-            r = em_get("https://reportapi.eastmoney.com/report/list",
-                       params=params,
-                       headers={"Referer": "https://data.eastmoney.com/"}, timeout=30)
-
-            # reportapi 可能返回 JSONP 格式，需要剥离
-            text = r.text.strip()
-            if text.startswith("jQuery") or text.startswith("callback"):
-                # 提取 JSON 部分
-                match = _re.search(r'\((\{.*\})\)', text, _re.DOTALL)
-                if match:
-                    text = match.group(1)
-
-            d = _json.loads(text)
-            rows = d.get("data") or []
-            if not rows:
-                break
-            all_records.extend(rows)
-            if page >= (d.get("TotalPage", 1) or 1):
-                break
-        except Exception as e:
-            print(f"[WARN] 研报获取第 {page} 页失败: {e}")
-            break
-    return all_records
-
-
-def margin_trading(code: str, page_size: int = 10) -> list:
-    """融资融券明细"""
-    data = eastmoney_datacenter(
-        "RPTA_WEB_RZRQ_GGMX",
-        filter_str=f'(SCODE="{code}")',
-        page_size=page_size,
-        sort_columns="DATE", sort_types="-1",
-    )
-    rows = []
-    for row in data:
-        rows.append({
-            "date": str(row.get("DATE", ""))[:10],
-            "rzye": row.get("RZYE", 0),
-            "rzmre": row.get("RZMRE", 0),
-            "rzche": row.get("RZCHE", 0),
-            "rqye": row.get("RQYE", 0),
-            "rqmcl": row.get("RQMCL", 0),
-            "rqchl": row.get("RQCHL", 0),
-            "rzrqye": row.get("RZRQYE", 0),
-        })
-    return rows
-
-
-def holder_num_change(code: str, page_size: int = 5) -> list:
-    """股东户数变化"""
-    data = eastmoney_datacenter(
-        "RPT_HOLDERNUMLATEST",
-        filter_str=f'(SECURITY_CODE="{code}")',
-        page_size=page_size,
-        sort_columns="END_DATE", sort_types="-1",
-    )
-    rows = []
-    for row in data:
-        rows.append({
-            "date": str(row.get("END_DATE", ""))[:10],
-            "holder_num": row.get("HOLDER_NUM", 0),
-            "change_num": row.get("HOLDER_NUM_CHANGE", 0),
-            "change_ratio": row.get("HOLDER_NUM_RATIO", 0),
-            "avg_shares": row.get("AVG_FREE_SHARES", 0),
-        })
-    return rows
-
-
-def dividend_history(code: str, page_size: int = 10) -> list:
-    """分红送转历史"""
-    data = eastmoney_datacenter(
-        "RPT_SHAREBONUS_DET",
-        filter_str=f'(SECURITY_CODE="{code}")',
-        page_size=page_size,
-        sort_columns="EX_DIVIDEND_DATE", sort_types="-1",
-    )
-    rows = []
-    for row in data:
-        # 东财返回的是每10股的金额，需要转换为每股
-        bonus_per_10 = row.get("PRETAX_BONUS_RMB", 0) or 0
-        bonus_per_share = round(bonus_per_10 / 10, 2) if bonus_per_10 else 0
-
-        transfer_per_10 = row.get("TRANSFER_RATIO", 0) or 0
-        transfer_per_share = round(transfer_per_10 / 10, 2) if transfer_per_10 else 0
-
-        bonus_ratio_per_10 = row.get("BONUS_RATIO", 0) or 0
-        bonus_ratio_per_share = round(bonus_ratio_per_10 / 10, 2) if bonus_ratio_per_10 else 0
-
-        rows.append({
-            "date": str(row.get("EX_DIVIDEND_DATE", ""))[:10],
-            "bonus_rmb": bonus_per_share,  # 每股派息
-            "transfer_ratio": transfer_per_share,  # 每股转增
-            "bonus_ratio": bonus_ratio_per_share,  # 每股送股
-            "plan": row.get("ASSIGN_PROGRESS", ""),
-        })
-    return rows
-
-
-def lockup_expiry(code: str, trade_date: str, forward_days: int = 90) -> dict:
-    """限售解禁日历"""
-    start = datetime.strptime(trade_date, "%Y-%m-%d") - timedelta(days=365)
-    start_str = start.strftime("%Y-%m-%d")
-
-    history_data = eastmoney_datacenter(
-        "RPT_LIFT_STAGE",
-        filter_str=f"(SECURITY_CODE=\"{code}\")(FREE_DATE>='{start_str}')(FREE_DATE<='{trade_date}')",
-        page_size=10,
-        sort_columns="FREE_DATE", sort_types="-1",
-    )
-    history = []
-    for row in history_data:
-        history.append({
-            "date": str(row.get("FREE_DATE", ""))[:10],
-            "type": row.get("LIMITED_STOCK_TYPE", ""),
-            "shares": row.get("FREE_SHARES_NUM", 0),
-            "ratio": row.get("FREE_RATIO", 0),
-        })
-
-    end_date = datetime.strptime(trade_date, "%Y-%m-%d") + timedelta(days=forward_days)
-    end_str = end_date.strftime("%Y-%m-%d")
-    upcoming_data = eastmoney_datacenter(
-        "RPT_LIFT_STAGE",
-        filter_str=f"(SECURITY_CODE=\"{code}\")(FREE_DATE>='{trade_date}')(FREE_DATE<='{end_str}')",
-        page_size=10,
-        sort_columns="FREE_DATE", sort_types="1",
-    )
-    upcoming = []
-    for row in upcoming_data:
-        upcoming.append({
-            "date": str(row.get("FREE_DATE", ""))[:10],
-            "type": row.get("LIMITED_STOCK_TYPE", ""),
-            "shares": row.get("FREE_SHARES_NUM", 0),
-            "ratio": row.get("FREE_RATIO", 0),
-        })
-
-    return {"history": history, "upcoming": upcoming}
-
-
-def eastmoney_stock_news(code: str, page_size: int = 10) -> list:
-    """东财个股新闻"""
-    import json
-    import re
-
-    cb = "jQuery_news"
-    url = "https://search-api-web.eastmoney.com/search/jsonp"
-    inner_params = json.dumps({
-        "uid": "",
-        "keyword": code,
-        "type": ["cmsArticleWebOld"],
-        "client": "web",
-        "clientType": "web",
-        "clientVersion": "curr",
-        "param": {"cmsArticleWebOld": {"searchScope": "default", "sort": "default",
-                  "pageIndex": 1, "pageSize": page_size, "preTag": "", "postTag": ""}},
-    }, separators=(',', ':'))
-    params = {"cb": cb, "param": inner_params}
-    headers = {"User-Agent": UA, "Referer": "https://so.eastmoney.com/"}
-    r = em_get(url, params=params, headers=headers, timeout=15)
-
-    text = r.text
-    if "(" not in text or ")" not in text:
-        return []
-    json_str = text[text.index("(") + 1 : text.rindex(")")]
-    d = json.loads(json_str)
-
-    rows = []
-    articles = d.get("result", {}).get("cmsArticleWebOld", []) or []
-    for a in articles:
-        rows.append({
-            "title": re.sub(r'<[^>]+>', '', a.get("title", "")),
-            "content": re.sub(r'<[^>]+>', '', a.get("content", ""))[:200],
-            "time": a.get("date", ""),
-            "source": a.get("mediaName", ""),
-            "url": a.get("url", ""),
-        })
-    return rows
 
 
 # ==================== 分析函数 ====================
@@ -637,35 +598,28 @@ def analyze_stock(input_str: str):
         print(f"[ERROR] 行情获取失败: {e}")
     print()
 
-    # 4. 获取基本面信息（东财）
-    print("【2】基本面信息（东财）")
+    # 4. 获取基本面信息（新浪）
+    print("【2】基本面信息（新浪）")
     print("-" * 80)
     try:
-        info = eastmoney_stock_info(code)
-        print(f"所属行业: {info['industry']}")
-        print(f"总股本: {info['total_shares']/1e8:.2f} 亿股")
-        print(f"流通股本: {info['float_shares']/1e8:.2f} 亿股")
-        print(f"上市日期: {info['list_date']}")
+        info = sina_stock_info(code)
+        if info:
+            print(f"股票名称: {info.get('name', 'N/A')}")
+            print(f"所属行业: {info.get('industry', 'N/A')}")
+            if info.get('total_shares'):
+                print(f"总股本: {info['total_shares']/1e8:.2f} 亿股")
+            if info.get('float_shares'):
+                print(f"流通股本: {info['float_shares']/1e8:.2f} 亿股")
+            if info.get('list_date'):
+                print(f"上市日期: {info['list_date']}")
+        else:
+            print("无基本面数据")
     except Exception as e:
         print(f"[ERROR] 基本面获取失败: {e}")
     print()
 
-    # 5. 获取板块归属
-    print("【3】板块归属（东财）")
-    print("-" * 80)
-    try:
-        blocks = eastmoney_concept_blocks(code)
-        print(f"共 {blocks['total']} 个板块")
-        if blocks['concept_tags']:
-            print("板块列表:")
-            for i, tag in enumerate(blocks['concept_tags'][:15], 1):
-                print(f"  {i}. {tag}")
-    except Exception as e:
-        print(f"[ERROR] 板块归属获取失败: {e}")
-    print()
-
-    # 6. 获取财务数据（mootdx）
-    print("【4】财务快照（mootdx）")
+    # 5. 获取财务数据（mootdx）
+    print("【3】财务快照（mootdx）")
     print("-" * 80)
     try:
         fin = mootdx_finance(code)
@@ -677,12 +631,20 @@ def analyze_stock(input_str: str):
             print(f"主营收入: {fin.get('income', 'N/A')} 元")
             print(f"总股本: {fin.get('zongguben', 'N/A')}")
             print(f"流通股本: {fin.get('liutongguben', 'N/A')}")
+        else:
+            # 尝试新浪接口
+            sina_fin = sina_finance_data(code)
+            if sina_fin:
+                print(f"每股收益(EPS): {sina_fin.get('eps', 'N/A')} 元")
+                print(f"每股净资产: {sina_fin.get('bvps', 'N/A')} 元")
+            else:
+                print("无财务数据")
     except Exception as e:
         print(f"[ERROR] 财务数据获取失败: {e}")
     print()
 
-    # 7. 获取一致预期
-    print("【5】机构一致预期（同花顺）")
+    # 6. 获取一致预期
+    print("【4】机构一致预期（同花顺）")
     print("-" * 80)
     try:
         df_eps = ths_eps_forecast(code)
@@ -695,53 +657,11 @@ def analyze_stock(input_str: str):
         print(f"[ERROR] 一致预期获取失败: {e}")
     print()
 
-    # 8. 获取研报列表
-    print("【6】近期研报（东财）")
+    # 7. 获取资金流向（120日）
+    print("【5】近120日资金流向（新浪）")
     print("-" * 80)
     try:
-        reports = eastmoney_reports(code, max_pages=1)
-        if reports:
-            print(f"共 {len(reports)} 篇研报")
-            for i, r in enumerate(reports[:5], 1):
-                date = (r.get('publishDate') or '')[:10]
-                org = r.get('orgSName', '')
-                title = r.get('title', '')[:60]
-                rating = r.get('emRatingName', '')
-                print(f"  {i}. [{date}] {org} - {title} ({rating})")
-        else:
-            print("无研报")
-    except Exception as e:
-        print(f"[ERROR] 研报获取失败: {e}")
-    print()
-
-    # 9. 获取资金流向（当日）
-    print("【7】当日资金流向（东财）")
-    print("-" * 80)
-    try:
-        flow = eastmoney_fund_flow_minute(code)
-        if flow:
-            last = flow[-1]
-            print(f"最新时间点: {last['time']}")
-            print(f"主力净流入: {last['main_net']/1e4:.2f} 万元")
-            print(f"超大单净流入: {last['super_net']/1e4:.2f} 万元")
-            print(f"大单净流入: {last['large_net']/1e4:.2f} 万元")
-            print(f"中单净流入: {last['mid_net']/1e4:.2f} 万元")
-            print(f"小单净流入: {last['small_net']/1e4:.2f} 万元")
-
-            # 统计全天
-            total_main = sum(f['main_net'] for f in flow)
-            print(f"\n全天主力累计净流入: {total_main/1e4:.2f} 万元")
-        else:
-            print("无资金流数据（可能非交易时间）")
-    except Exception as e:
-        print(f"[ERROR] 资金流向获取失败: {e}")
-    print()
-
-    # 10. 获取120日资金流
-    print("【8】近120日资金流向（东财）")
-    print("-" * 80)
-    try:
-        flow_120 = stock_fund_flow_120d(code)
+        flow_120 = sina_fund_flow(code, days=120)
         if flow_120:
             print(f"共 {len(flow_120)} 个交易日数据")
             recent_20 = flow_120[-20:]
@@ -757,11 +677,11 @@ def analyze_stock(input_str: str):
         print(f"[ERROR] 120日资金流获取失败: {e}")
     print()
 
-    # 11. 获取融资融券
-    print("【9】融资融券（东财）")
+    # 8. 获取融资融券
+    print("【6】融资融券（新浪）")
     print("-" * 80)
     try:
-        margin = margin_trading(code, page_size=5)
+        margin = sina_margin_trading(code, page_size=5)
         if margin:
             print(f"最近 {len(margin)} 个交易日:")
             for d in margin:
@@ -774,11 +694,11 @@ def analyze_stock(input_str: str):
         print(f"[ERROR] 融资融券获取失败: {e}")
     print()
 
-    # 12. 获取股东户数
-    print("【10】股东户数变化（东财）")
+    # 9. 获取股东户数
+    print("【7】股东户数变化（新浪）")
     print("-" * 80)
     try:
-        holders = holder_num_change(code, page_size=5)
+        holders = sina_holder_num(code, page_size=5)
         if holders:
             print("股东户数变化:")
             for d in holders:
@@ -790,11 +710,11 @@ def analyze_stock(input_str: str):
         print(f"[ERROR] 股东户数获取失败: {e}")
     print()
 
-    # 13. 获取分红历史
-    print("【11】分红送转历史（东财）")
+    # 10. 获取分红历史
+    print("【8】分红送转历史（新浪）")
     print("-" * 80)
     try:
-        dividends = dividend_history(code, page_size=5)
+        dividends = sina_dividend_history(code, page_size=5)
         if dividends:
             print("近期分红:")
             for d in dividends:
@@ -808,12 +728,12 @@ def analyze_stock(input_str: str):
         print(f"[ERROR] 分红历史获取失败: {e}")
     print()
 
-    # 14. 获取解禁预警
-    print("【12】限售解禁预警（东财）")
+    # 11. 获取解禁预警
+    print("【9】限售解禁预警（新浪）")
     print("-" * 80)
     try:
         today = datetime.now().strftime("%Y-%m-%d")
-        lockup = lockup_expiry(code, today)
+        lockup = sina_lockup_expiry(code, today)
         if lockup['history']:
             print(f"近1年历史解禁 {len(lockup['history'])} 批:")
             for h in lockup['history'][:3]:
@@ -828,15 +748,15 @@ def analyze_stock(input_str: str):
         print(f"[ERROR] 解禁预警获取失败: {e}")
     print()
 
-    # 15. 获取新闻
-    print("【13】近期新闻（东财）")
+    # 12. 获取新闻
+    print("【10】近期新闻（新浪）")
     print("-" * 80)
     try:
-        news = eastmoney_stock_news(code, page_size=5)
+        news = sina_stock_news(code, page_size=5)
         if news:
             print(f"共 {len(news)} 条新闻")
             for i, n in enumerate(news[:5], 1):
-                print(f"  {i}. [{n['time']}] {n['source']} - {n['title']}")
+                print(f"  {i}. {n['title']}")
         else:
             print("无新闻")
     except Exception as e:
