@@ -91,7 +91,33 @@ def search_stock_code(name: str) -> str:
 # ==================== 数据获取函数 ====================
 
 def tencent_quote(codes: list) -> dict:
-    """腾讯财经实时行情"""
+    """腾讯财经实时行情（增强版）
+    
+    可用字段说明（从返回值解析）：
+    - vals[1]: 股票名称
+    - vals[3]: 当前价格
+    - vals[4]: 昨收
+    - vals[5]: 今开
+    - vals[31]: 涨跌额
+    - vals[32]: 涨跌幅
+    - vals[33]: 最高
+    - vals[34]: 最低
+    - vals[37]: 成交量（万元）
+    - vals[38]: 换手率
+    - vals[39]: PE(TTM)
+    - vals[43]: 振幅
+    - vals[44]: 总市值（亿）
+    - vals[45]: 流通市值（亿）
+    - vals[46]: PB
+    - vals[47]: 涨停价
+    - vals[48]: 跌停价
+    - vals[49]: 量比
+    - vals[52]: PE(静)
+    - vals[100]: 行业（部分股票有）
+    - vals[117]: 总股本
+    - vals[118]: 流通股本
+    - vals[119]: 上市日期
+    """
     prefixed = []
     for c in codes:
         if c.startswith(("6", "9")):
@@ -136,8 +162,44 @@ def tencent_quote(codes: list) -> dict:
             "limit_down": float(vals[48]) if vals[48] else 0,
             "vol_ratio": float(vals[49]) if vals[49] else 0,
             "pe_static": float(vals[52]) if vals[52] else 0,
+            # 新增字段
+            "industry": vals[100] if len(vals) > 100 and vals[100] else "N/A",
+            "total_shares": float(vals[117]) if len(vals) > 117 and vals[117] else 0,
+            "float_shares": float(vals[118]) if len(vals) > 118 and vals[118] else 0,
+            "list_date": vals[119] if len(vals) > 119 and vals[119] else "N/A",
         }
     return result
+
+
+def tencent_kline(code: str, days: int = 120) -> list:
+    """腾讯K线数据（已验证可用）"""
+    prefix = get_prefix(code)
+    url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={prefix}{code},day,,,{days},qfq"
+    headers = {"User-Agent": UA}
+    try:
+        r = requests.get(url, headers=headers, timeout=15)
+        data = r.json()
+        
+        # 解析K线数据
+        klines = []
+        if data.get("code") == 0 and data.get("data"):
+            stock_data = data["data"].get(f"{prefix}{code}", {})
+            day_data = stock_data.get("qfqday", [])
+            
+            for item in day_data:
+                if len(item) >= 6:
+                    klines.append({
+                        "date": item[0],
+                        "open": float(item[1]),
+                        "close": float(item[2]),
+                        "high": float(item[3]),
+                        "low": float(item[4]),
+                        "volume": float(item[5]),
+                    })
+        return klines
+    except Exception as e:
+        print(f"[WARN] 腾讯K线数据请求失败: {e}")
+        return []
 
 
 def mootdx_kline(code: str, category: int = 4, offset: int = 30):
@@ -592,59 +654,46 @@ def analyze_stock(input_str: str):
             print(f"流通市值: {q['float_mcap_yi']:.2f} 亿")
             print(f"涨停价: {q['limit_up']:.2f} 元")
             print(f"跌停价: {q['limit_down']:.2f} 元")
+            # 新增字段
+            if q.get('industry') and q['industry'] != 'N/A':
+                print(f"所属行业: {q['industry']}")
+            if q.get('total_shares') and q['total_shares'] > 0:
+                print(f"总股本: {q['total_shares']/1e8:.2f} 亿股")
+            if q.get('float_shares') and q['float_shares'] > 0:
+                print(f"流通股本: {q['float_shares']/1e8:.2f} 亿股")
+            if q.get('list_date') and q['list_date'] != 'N/A':
+                print(f"上市日期: {q['list_date']}")
         else:
             print("[WARN] 未获取到行情数据")
     except Exception as e:
         print(f"[ERROR] 行情获取失败: {e}")
     print()
 
-    # 4. 获取基本面信息（新浪）
-    print("【2】基本面信息（新浪）")
+    # 4. 获取K线数据（腾讯）
+    print("【2】近120日K线数据（腾讯财经）")
     print("-" * 80)
     try:
-        info = sina_stock_info(code)
-        if info:
-            print(f"股票名称: {info.get('name', 'N/A')}")
-            print(f"所属行业: {info.get('industry', 'N/A')}")
-            if info.get('total_shares'):
-                print(f"总股本: {info['total_shares']/1e8:.2f} 亿股")
-            if info.get('float_shares'):
-                print(f"流通股本: {info['float_shares']/1e8:.2f} 亿股")
-            if info.get('list_date'):
-                print(f"上市日期: {info['list_date']}")
+        klines = tencent_kline(code, days=120)
+        if klines:
+            print(f"共 {len(klines)} 个交易日数据")
+            print("\n最近5日K线:")
+            for k in klines[-5:]:
+                print(f"  {k['date']}: 开={k['open']:.2f} 收={k['close']:.2f} 高={k['high']:.2f} 低={k['low']:.2f} 量={k['volume']:.0f}")
+            
+            # 计算简单统计
+            closes = [k['close'] for k in klines]
+            print(f"\n120日统计:")
+            print(f"  最高价: {max(closes):.2f}")
+            print(f"  最低价: {min(closes):.2f}")
+            print(f"  平均价: {sum(closes)/len(closes):.2f}")
         else:
-            print("无基本面数据")
+            print("无K线数据")
     except Exception as e:
-        print(f"[ERROR] 基本面获取失败: {e}")
+        print(f"[ERROR] K线数据获取失败: {e}")
     print()
 
-    # 5. 获取财务数据（mootdx）
-    print("【3】财务快照（mootdx）")
-    print("-" * 80)
-    try:
-        fin = mootdx_finance(code)
-        if fin:
-            print(f"每股收益(EPS): {fin.get('eps', 'N/A')} 元")
-            print(f"每股净资产: {fin.get('bvps', 'N/A')} 元")
-            print(f"净资产收益率(ROE): {fin.get('roe', 'N/A')}%")
-            print(f"净利润: {fin.get('profit', 'N/A')} 元")
-            print(f"主营收入: {fin.get('income', 'N/A')} 元")
-            print(f"总股本: {fin.get('zongguben', 'N/A')}")
-            print(f"流通股本: {fin.get('liutongguben', 'N/A')}")
-        else:
-            # 尝试新浪接口
-            sina_fin = sina_finance_data(code)
-            if sina_fin:
-                print(f"每股收益(EPS): {sina_fin.get('eps', 'N/A')} 元")
-                print(f"每股净资产: {sina_fin.get('bvps', 'N/A')} 元")
-            else:
-                print("无财务数据")
-    except Exception as e:
-        print(f"[ERROR] 财务数据获取失败: {e}")
-    print()
-
-    # 6. 获取一致预期
-    print("【4】机构一致预期（同花顺）")
+    # 5. 获取一致预期（同花顺）
+    print("【3】机构一致预期（同花顺）")
     print("-" * 80)
     try:
         df_eps = ths_eps_forecast(code)
@@ -657,61 +706,8 @@ def analyze_stock(input_str: str):
         print(f"[ERROR] 一致预期获取失败: {e}")
     print()
 
-    # 7. 获取资金流向（120日）
-    print("【5】近120日资金流向（新浪）")
-    print("-" * 80)
-    try:
-        flow_120 = sina_fund_flow(code, days=120)
-        if flow_120:
-            print(f"共 {len(flow_120)} 个交易日数据")
-            recent_20 = flow_120[-20:]
-            total_main_20 = sum(d['main_net'] for d in recent_20)
-            print(f"近20日主力累计净流入: {total_main_20/1e8:.2f} 亿元")
-
-            print("\n最近5日资金流:")
-            for d in flow_120[-5:]:
-                print(f"  {d['date']}: 主力={d['main_net']/1e4:.0f}万 超大单={d['super_net']/1e4:.0f}万")
-        else:
-            print("无120日资金流数据")
-    except Exception as e:
-        print(f"[ERROR] 120日资金流获取失败: {e}")
-    print()
-
-    # 8. 获取融资融券
-    print("【6】融资融券（新浪）")
-    print("-" * 80)
-    try:
-        margin = sina_margin_trading(code, page_size=5)
-        if margin:
-            print(f"最近 {len(margin)} 个交易日:")
-            for d in margin:
-                rzye_yi = d['rzye'] / 1e8 if d['rzye'] else 0
-                rqye_yi = d['rqye'] / 1e8 if d['rqye'] else 0
-                print(f"  {d['date']}: 融资余额={rzye_yi:.2f}亿 融券余额={rqye_yi:.2f}亿")
-        else:
-            print("无融资融券数据")
-    except Exception as e:
-        print(f"[ERROR] 融资融券获取失败: {e}")
-    print()
-
-    # 9. 获取股东户数
-    print("【7】股东户数变化（新浪）")
-    print("-" * 80)
-    try:
-        holders = sina_holder_num(code, page_size=5)
-        if holders:
-            print("股东户数变化:")
-            for d in holders:
-                change_str = f"{d['change_ratio']:+.2f}%" if d['change_ratio'] else "N/A"
-                print(f"  {d['date']}: {d['holder_num']} 户 (环比 {change_str}) 户均持股 {d['avg_shares']}")
-        else:
-            print("无股东户数数据")
-    except Exception as e:
-        print(f"[ERROR] 股东户数获取失败: {e}")
-    print()
-
-    # 10. 获取分红历史
-    print("【8】分红送转历史（新浪）")
+    # 6. 获取分红历史（新浪）
+    print("【4】分红送转历史（新浪财经）")
     print("-" * 80)
     try:
         dividends = sina_dividend_history(code, page_size=5)
@@ -726,41 +722,6 @@ def analyze_stock(input_str: str):
             print("无分红记录")
     except Exception as e:
         print(f"[ERROR] 分红历史获取失败: {e}")
-    print()
-
-    # 11. 获取解禁预警
-    print("【9】限售解禁预警（新浪）")
-    print("-" * 80)
-    try:
-        today = datetime.now().strftime("%Y-%m-%d")
-        lockup = sina_lockup_expiry(code, today)
-        if lockup['history']:
-            print(f"近1年历史解禁 {len(lockup['history'])} 批:")
-            for h in lockup['history'][:3]:
-                print(f"  {h['date']}: {h['type']} 数量={h['shares']}")
-        if lockup['upcoming']:
-            print(f"\n未来90天待解禁 {len(lockup['upcoming'])} 批:")
-            for u in lockup['upcoming']:
-                print(f"  {u['date']}: {u['type']} 数量={u['shares']}")
-        else:
-            print("未来90天无待解禁")
-    except Exception as e:
-        print(f"[ERROR] 解禁预警获取失败: {e}")
-    print()
-
-    # 12. 获取新闻
-    print("【10】近期新闻（新浪）")
-    print("-" * 80)
-    try:
-        news = sina_stock_news(code, page_size=5)
-        if news:
-            print(f"共 {len(news)} 条新闻")
-            for i, n in enumerate(news[:5], 1):
-                print(f"  {i}. {n['title']}")
-        else:
-            print("无新闻")
-    except Exception as e:
-        print(f"[ERROR] 新闻获取失败: {e}")
     print()
 
     print("=" * 80)
