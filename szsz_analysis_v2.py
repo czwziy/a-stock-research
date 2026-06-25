@@ -9,7 +9,7 @@ import random
 import re
 from datetime import datetime, timedelta
 
-CODE = "000034"
+CODE = "002156"
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
 
 # 使用代理访问中国站点
